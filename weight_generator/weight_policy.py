@@ -122,5 +122,6 @@ class PolicyDefinition:
                                                )
 
     def _add_objective_func(self):
+        """Adding a Minimization objective to prevent over inflation of weights."""
 
         self.solver.minimize(self.solver.sum(self.weights.sl_var))

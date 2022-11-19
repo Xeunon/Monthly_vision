@@ -12,59 +12,30 @@ class LPProblem:
     and addition using problem input data."""
 
     @staticmethod
-    def LinExpCheck(inst):
+    def lin_exp_check(inst):
         if isinstance(inst, LinearExpr):
-            return False
-        else:
             return True
+        else:
+            return False
 
     def __init__(self,
                  lp_data: LPData,
                  lp_solver: Model):
         self.data = lp_data
         self.solver = lp_solver
-        self.batch = BatchVariable(lp_data.product_data,
-                                   lp_data.prod_active_window,
-                                   lp_data.timing_data,
-                                   lp_data.machine_available_time.filter(['Machine_Code', 'Process']),
-                                   lp_data.opc_data.iloc[:, -8:],
-                                   lp_data.prod_allocations,
-                                   lp_solver)
-        self.prod_loss = SlackVariable("Prod_loss",
-                                       lp_data.prod_active_window,
-                                       lp_data.product_data,
-                                       lp_solver)
-        self.expiry = SlackVariable("expiry",
-                                    lp_data.prod_active_window,
-                                    lp_data.product_data,
-                                    lp_solver)
-        self.salesloss = SlackVariable("sales_loss",
-                                       lp_data.prod_active_window,
-                                       lp_data.product_data,
-                                       lp_solver)
-        self.gb_loss = SlackVariable("gb_loss",
-                                     lp_data.prod_active_window,
-                                     lp_data.product_data,
-                                     lp_solver)
-        self.overstock = SlackVariable("over_stock",
-                                       lp_data.prod_active_window,
-                                       lp_data.product_data,
-                                       lp_solver)
-        self.gb_loss_ftr = SlackVariable("future_gb_loss",
-                                         lp_data.future_active_window,
-                                         lp_data.product_data,
-                                         lp_solver)
-        self.overstock_ftr = SlackVariable("future_over_stock",
-                                           lp_data.future_active_window,
-                                           lp_data.product_data,
-                                           lp_solver)
+        self.batch = BatchVariable(lp_data, lp_solver)
+        self.prod_loss = SlackVariable("Prod_loss", lp_data, lp_solver)
+        self.expiry = SlackVariable("expiry", lp_data, lp_solver)
+        self.salesloss = SlackVariable("sales_loss", lp_data, lp_solver)
+        self.gb_loss = SlackVariable("gb_loss", lp_data, lp_solver)
+        self.overstock = SlackVariable("over_stock", lp_data, lp_solver)
+        self.gb_loss_ftr = SlackVariable("future_gb_loss", lp_data, lp_solver)
+        self.overstock_ftr = SlackVariable("future_over_stock", lp_data, lp_solver)
         self.closing_salable, self.future_closing, self.box_output = self._generate_closing_stocks()
 
         self.mps_times = self._add_mps_time_constraint()
         self._add_holding_prereq_constraint()
         self._add_first_period_holding_constraint()
-        self.rm_closing, self.rm_codes = self._add_raw_material_constraint()
-        self.pm_closing, self.pm_codes = self._add_package_material_constraint()
         self._add_salesloss_constraint()
         self._add_productionloss_constraint()
         self._add_gbloss_constraint()
@@ -79,15 +50,15 @@ class LPProblem:
         Future-closing = total_production + opening - total_demand - future_sales"""
 
         available_wip = self.data.wip_tensor
-        output_batch = self.batch.get_output_batch(available_wip)
+        total_box_output = self.batch.get_output_box(available_wip)
         period_count = self.data.run_duration
-        batch_size = self.data.product_data["Approved_Batch_Size_MIP"].to_numpy()
-        first_opening = self.data.get_prod_weight("Opening_Product_Inv")
-        total_box_output = np.multiply(output_batch, batch_size[:, np.newaxis])
+        batch_size = self.data.product_data.drop_duplicates(subset="inter_code")["Batch_Box"].to_numpy()
+        first_opening = self.data.get_prod_weight("Opening_Stock")
+        # total_box_output = np.multiply(output_batch, batch_size[:, np.newaxis])
         # Calculating the closing salable stock of each period
-        cumu_box_output = np.multiply(np.cumsum(output_batch, axis=1), batch_size[:, np.newaxis])
+        cumu_box_output = np.cumsum(total_box_output, axis=1)
         unique_skus = self.data.product_data["SKU_Code"].unique()
-        skus = self.data.product_data["SKU_Code"].to_numpy()
+        skus = self.data.product_data["SKU_Code"].drop(labels=self.data.mask).to_numpy()
         sku_cumu_output = np.empty(shape=(unique_skus.shape[0], period_count), dtype=np.object)
         sku_box_output = np.empty(shape=(unique_skus.shape[0], period_count), dtype=np.object)
         for i in range(unique_skus.shape[0]):
@@ -102,7 +73,7 @@ class LPProblem:
         # Calculating future closing stock
         future_demand = self.data.ftr_demand_mat.groupby(by='SKU_Code', sort=False).mean().to_numpy()
         future_closing = closing_salable[:, -1] - future_demand
-        return closing_salable, future_closing, total_box_output
+        return closing_salable, future_closing, sku_box_output
 
     def _add_mps_time_constraint(self):
         timing_data = self.data.timing_data
@@ -112,7 +83,7 @@ class LPProblem:
             self.data.machine_available_time[list(map
                                                   (str,
                                                    self.data.solve_window_dates))].to_numpy() - mps_time_all
-        for member in mps_time_constraint[list(map(self.LinExpCheck, mps_time_constraint))].flatten():
+        for member in mps_time_constraint.flatten()[list(map(self.lin_exp_check, mps_time_constraint.flatten()))]:
             self.solver.add_constraint(member >= 0)
         return cycle_times_all
 
@@ -196,7 +167,7 @@ class LPProblem:
         cumulative_rm_open = np.repeat(opening_vec[:, np.newaxis], repeats=period_count, axis=1)
         cumulative_rm_order = np.cumsum(rm_order + production_support, axis=1)
         rm_closing = cumulative_rm_open + cumulative_rm_order - cumu_rm_consumption
-        for member in rm_closing[list(map(self.LinExpCheck, rm_closing))].flatten():
+        for member in rm_closing[list(map(self.lin_exp_check, rm_closing))].flatten():
             self.solver.add_constraint(member >= 0)
         return rm_closing, material_codes
 
@@ -262,47 +233,78 @@ class LPProblem:
         opening_vec = opening_vec.flatten()
         cumulative_pm_open = np.repeat(opening_vec[:, np.newaxis], repeats=period_count, axis=1)
         pm_closing = cumulative_pm_open + cumulative_pm_order - cumu_pm_consumption
-        for member in pm_closing[list(map(self.LinExpCheck, pm_closing))].flatten():
+        for member in pm_closing[list(map(self.lin_exp_check, pm_closing))].flatten():
             self.solver.add_constraint(member >= 0)
         return pm_closing, pm_material_codes
 
     def _add_salesloss_constraint(self):
         salesloss_limit = self.data.sales_loss_lim.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        salesloss_constraint = self.closing_salable + self.salesloss.var - salesloss_limit
-        for member in salesloss_constraint[list(map(self.LinExpCheck, salesloss_constraint))].flatten():
+        salesloss_constraint = np.divide(self.closing_salable, salesloss_limit,
+                                         where=(salesloss_limit != 0),
+                                         out=np.zeros_like(salesloss_limit, dtype=np.object)) \
+                               + self.salesloss.var - salesloss_limit.astype(bool).astype(int)
+        for member in salesloss_constraint.flatten()[list(map(self.lin_exp_check, salesloss_constraint.flatten()))]:
             self.solver.add_constraint(member >= 0)
 
     def _add_productionloss_constraint(self):
         ul_ss = self.data.ul_ss.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        prodloss_constraint = self.closing_salable + self.prod_loss.var - ul_ss
-        for member in prodloss_constraint[list(map(self.LinExpCheck, prodloss_constraint))].flatten():
+        prodloss_constraint = np.divide(self.closing_salable, ul_ss,
+                                        where=(ul_ss != 0),
+                                        out=np.zeros_like(ul_ss, dtype=np.object)) \
+                              + self.prod_loss.var - ul_ss.astype(bool).astype(int)
+        for member in prodloss_constraint.flatten()[list(map(self.lin_exp_check, prodloss_constraint.flatten()))]:
             self.solver.add_constraint(member >= 0)
 
     def _add_gbloss_constraint(self):
         ll_ss = self.data.ll_ss.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        gbloss_constraint = self.closing_salable + self.gb_loss.var - ll_ss
-        for member in gbloss_constraint[list(map(self.LinExpCheck, gbloss_constraint))].flatten():
+        gbloss_constraint = np.divide(self.closing_salable, ll_ss,
+                                      where=(ll_ss != 0),
+                                      out=np.zeros_like(ll_ss, dtype=np.object)
+                                      ) + self.gb_loss.var - ll_ss.astype(bool).astype(int)
+        for member in gbloss_constraint.flatten()[list(map(self.lin_exp_check, gbloss_constraint.flatten()))]:
             self.solver.add_constraint(member >= 0)
 
     def _add_overstock_constraint(self):
         ul_ss = self.data.ul_ss.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        overstock_constraint = self.closing_salable - self.overstock.var - ul_ss
-        for member in overstock_constraint[list(map(self.LinExpCheck, overstock_constraint))].flatten():
+        overstock_constraint = np.divide(self.closing_salable, ul_ss,
+                                         where=(ul_ss != 0),
+                                         out=np.zeros_like(ul_ss, dtype=np.object)) \
+                               - self.overstock.var - ul_ss.astype(bool).astype(int)
+        for member in overstock_constraint.flatten()[list(map(self.lin_exp_check, overstock_constraint.flatten()))]:
             self.solver.add_constraint(member <= 0)
 
     def _add_ftr_gbloss_constraint(self):
         future_ll_ss = self.data.future_ll_ss.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        future_gbloss_constraint = self.future_closing + self.gb_loss_ftr.var[:, 0] - future_ll_ss
-        for member in future_gbloss_constraint[list(map(self.LinExpCheck, future_gbloss_constraint))].flatten():
+        future_gbloss_constraint = np.divide(self.future_closing, future_ll_ss,
+                                             where=(future_ll_ss != 0),
+                                             out=np.zeros_like(future_ll_ss, dtype=np.object)) \
+                                   + self.gb_loss_ftr.var[:, 0] - future_ll_ss.astype(bool).astype(int)
+        for member in future_gbloss_constraint.flatten()[list(map(self.lin_exp_check, future_gbloss_constraint.flatten()))]:
             self.solver.add_constraint(member >= 0)
 
     def _add_ftr_overstock_constraint(self):
         future_ul_ss = self.data.future_ul_ss.groupby(by='SKU_Code', sort=False).mean().to_numpy()
-        future_overstock_constraint = self.future_closing - self.overstock_ftr.var[:, 0] - future_ul_ss
-        for member in future_overstock_constraint[list(map(self.LinExpCheck, future_overstock_constraint))].flatten():
+        future_overstock_constraint = np.divide(self.future_closing, future_ul_ss,
+                                                where=(future_ul_ss != 0),
+                                                out=np.zeros_like(future_ul_ss, dtype=np.object)) \
+                                      - self.overstock_ftr.var[:, 0] - future_ul_ss.astype(bool).astype(int)
+        for member in future_overstock_constraint.flatten()[list(map(self.lin_exp_check, future_overstock_constraint.flatten()))]:
             self.solver.add_constraint(member <= 0)
 
     def _define_objective_function(self):
+        def duplicate_sku_calc():
+            """Since numpy.unique automatically sorts its outputs, we have to reorder the outputs to match
+               our input data."""
+            all_skus = self.data.product_data["SKU_Code"].to_numpy()
+            unique_skus, sku_counts = np.unique(all_skus, return_counts=True)
+            sorted_df = pd.DataFrame(data=np.vstack([unique_skus, sku_counts]).T, columns=["SKU", "Counts"])
+            ordered_df = pd.DataFrame(data=pd.unique(all_skus), columns=["SKU"])
+            ordered_df = pd.merge(ordered_df, sorted_df, how="left", on="SKU")
+            unique_skus, sku_counts = ordered_df["SKU"].to_numpy(), ordered_df["Counts"].to_numpy()
+            duplicated_skus = unique_skus[sku_counts >= 2]
+            dupl_sku_index = [np.where(all_skus == sku)[0][0] for sku in duplicated_skus]
+            return dupl_sku_index, sku_counts
+
         farvardin = self.data.farvardin
         farvardin_f = self.data.farvardin_f
         strategic_tier = self.data.strategic_tier
@@ -320,9 +322,10 @@ class LPProblem:
         in_gb_weight_f = self.data.get_prod_weight("IN_GB_Weight", future=True)
         op_batch_output = self.batch.generate_op_batch_variables(self.data.wip_tensor)
         all_skus = self.data.product_data["SKU_Code"].to_numpy()
-        unique_skus, sku_count = np.unique(all_skus, return_counts=True)
-        inter_code_weight = np.repeat(strategic_weight, sku_count)[:, np.newaxis] \
-                            * np.repeat(monthly_weight, sku_count, axis=0)
+        dupl_sku_index, sku_count = duplicate_sku_calc()
+
+        inter_code_weight = np.repeat(strategic_weight, sku_count, axis=0)[:, np.newaxis] * np.repeat(monthly_weight,
+                                                                                                      sku_count, axis=0)
 
         objective = (self.solver.sum(self.salesloss.var
                                      * monthly_weight
@@ -355,7 +358,7 @@ class LPProblem:
                                        * future_over_stock_weight[:, np.newaxis]
                                        * farvardin_f[:, np.newaxis]) / 10 ** 22
                      - self.solver.sum(op_batch_output[:, :-2, :]
-                                       * inter_code_weight[:, np.newaxis, :]) / 10 ** 22
+                                       * inter_code_weight[:, np.newaxis, :]) / 10 ** 20
                      + self.solver.sum(self.expiry.var * 10 ** 27) / 10 ** 22
                      )
 

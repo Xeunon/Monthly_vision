@@ -9,20 +9,16 @@ class BatchVariable:
      helper functions for getting access to needed aggregations of the variables."""
 
     def __init__(self,
-                 product_data: pd.DataFrame,
-                 product_periods: np.ndarray,
-                 timing_data: pd.DataFrame,
-                 op_machines: pd.DataFrame,
-                 product_opc: pd.DataFrame,
-                 product_allocations: np.ndarray,
+                 lp_data,
                  solver: Model):
-        self.inter_codes = timing_data.index.to_numpy()
-        self.product_level = product_data.filter(["Product_Code", "Product_Counter"])
-        self.periods = product_periods
-        self.allocations = product_allocations
-        self.machines = timing_data.columns
-        self.op_machines = op_machines
-        self.opc = product_opc
+        self.with_site = lp_data.timing_data.index.to_numpy()
+        self.mask = lp_data.mask
+        self.product_level = lp_data.product_data.filter(["Product_Code", "Product_Counter", "Batch_Box"])
+        self.periods = lp_data.prod_active_window
+        self.allocations = lp_data.prod_allocations
+        self.machines = lp_data.timing_data.columns
+        self.op_machines = lp_data.machine_available_time.filter(['Machine_Code', 'Process'])
+        self.opc = lp_data.opc_data.iloc[:, -8:]
         self.solver = solver
         self.x = self._create_int_batch_variables()
         self.op_machine_indices = self._get_op_machine_indices(return_dict=False)
@@ -44,7 +40,7 @@ class BatchVariable:
         """Returns the batch variables that belong to the same operation"""
         opc_matrix = self.opc.to_numpy()
         op_count = opc_matrix.shape[1]
-        product_count = self.inter_codes.shape[0]
+        product_count = self.with_site.shape[0]
         period_count = self.periods.shape[1]
         op_batch = np.empty(shape=[product_count, op_count, period_count], dtype=np.object)
         op_batch[:, :, :] = 0
@@ -80,7 +76,7 @@ class BatchVariable:
         """Returns the batches produced on the final operation of each
         product in each period"""
         first_op_indices = self.opc.to_numpy().argmax(axis=1)
-        product_count = self.inter_codes.shape[0]
+        product_count = self.with_site.shape[0]
         period_count = self.periods.shape[1]
         input_batch = np.empty(shape=[product_count, period_count], dtype=np.object)
         input_batch[:, :] = 0
@@ -90,16 +86,19 @@ class BatchVariable:
         return input_batch
 
     # Ready to use
-    def get_output_batch(self, wip_tensor: np.ndarray):
+    def get_output_box(self, wip_tensor: np.ndarray):
         """Returns the batches produced on the final operation of each
         product in each period and also sums the output of products with
         identical product codes."""
         last_op_indices = np.maximum(self.opc.shape[1] - np.flip(self.opc.to_numpy(), axis=1).argmax(axis=1) - 1, 6)
+        # self.product_level["site"] = self.product_level["with_site"].map(lambda x: x[-1])
+        # self.product_level["inter_prod"] = (self.product_level["Product_Code"].astype(str) + \
+        #                                     self.product_level["site"].astype(str)).astype(int)
         product_codes = self.product_level["Product_Code"].to_numpy()
         product_counters = self.product_level["Product_Counter"].to_numpy()
         unique_codes, count = np.unique(product_codes, return_counts=True)
         duplicate_codes = unique_codes[count > 1]
-        product_count = self.inter_codes.shape[0]
+        product_count = self.with_site.shape[0]
         period_count = self.periods.shape[1]
         output_batch = np.empty(shape=[product_count, period_count], dtype=np.object)
         output_batch[:, :] = 0
@@ -107,19 +106,28 @@ class BatchVariable:
             prod_code = product_codes[prod]
             # machine_indices = op_index_list[last_op_indices[prod]]
             op_index = last_op_indices[prod]
+            # if prod_code in duplicate_codes:
+            #     if product_counters[prod] == 1:
+            #         product_indices = list(np.where(product_codes == prod_code)[0])
+            #         output_batch[prod, :][self.periods[prod]] = \
+            #             self.get_op_batch_variable(product_indices, op_index)[self.periods[prod]] + \
+            #             wip_tensor[prod, op_index, :][self.periods[prod]]
+            # else:
+            output_batch[prod, :] = self.get_op_batch_variable(prod, op_index) + \
+                                    wip_tensor[prod, op_index, :]
+        output_box = output_batch * self.product_level["Batch_Box"].to_numpy()[:, np.newaxis]
+        for prod in range(product_count):
+            prod_code = product_codes[prod]
             if prod_code in duplicate_codes:
-                if product_counters[prod] == 1:
-                    product_indices = list(np.where(product_codes == prod_code)[0])
-                    output_batch[prod, :][self.periods[prod]] = \
-                        self.get_op_batch_variable(product_indices, op_index)[self.periods[prod]] + \
-                        wip_tensor[prod, op_index, :][self.periods[prod]]
-            else:
-                output_batch[prod, :] = self.get_op_batch_variable(prod, op_index) + \
-                                        wip_tensor[prod, op_index, :]
+                product_indices = list(np.where(product_codes == prod_code)[0])
+                output_box[product_indices] = np.sum(output_box[product_indices, :], axis=0)
+                # Warning: This method permanently changes duplicate_codes
+                duplicate_codes = np.delete(duplicate_codes, np.where(duplicate_codes == prod_code)[0])
 
-        return output_batch
-
-    # TODO: Cumulative output batch
+        # output_batch = np.delete(output_batch, self.mask, axis=0)
+        output_box *= self.product_level["Product_Counter"].to_numpy()[:, np.newaxis]
+        output_box = np.delete(output_box, self.mask, axis=0)
+        return output_box
 
     # Ready to use
     def _get_op_machine_indices(self, return_dict=True):

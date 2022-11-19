@@ -13,11 +13,46 @@ def lin_expr_check(inst):
 
 
 def generate_production_report(lp_data: LPData, lp_problem: LPProblem):
+    def duplicate_sku_calc():
+        """Since numpy.unique automatically sorts its outputs, we have to reorder the outputs to match
+           our input data."""
+        all_skus = lp_data.product_data["SKU_Code"].to_numpy()
+        unique_skus, sku_counts = np.unique(all_skus, return_counts=True)
+        sorted_df = pd.DataFrame(data=np.vstack([unique_skus, sku_counts]).T, columns=["SKU", "Counts"])
+        ordered_df = pd.DataFrame(data=pd.unique(all_skus), columns=["SKU"])
+        ordered_df = pd.merge(ordered_df, sorted_df, how="left", on="SKU")
+        unique_skus, sku_counts = ordered_df["SKU"].to_numpy(), ordered_df["Counts"].to_numpy()
+        duplicated_skus = unique_skus[sku_counts >= 2]
+        dupl_sku_index = [np.where(all_skus == sku)[0][0] for sku in duplicated_skus]
+        return dupl_sku_index, sku_counts
+
+    def get_2d_var_value(variable):
+        var_value = np.zeros_like(variable)
+        a, b = np.where(variable)
+        for var in zip(a, b):
+            try:
+                var_value[var] = variable[var].solution_value
+            except AttributeError:
+                var_value[var] = variable[var]
+        return var_value
+
+    def _slack_converter(slack_var, expiry=False):
+        # if not expiry:
+        #     reshaped_slack = np.repeat(slack_var, sku_count, axis=0)
+        #     reshaped_slack[dupl_sku_indices, :] = 0
+        # else:
+        reshaped_slack = slack_var
+        slack_out = np.zeros_like(reshaped_slack)
+        a, b = np.where(reshaped_slack)
+        for var in zip(a, b):
+            slack_out[var] = reshaped_slack[var].solution_value
+        return slack_out
+
     period_count = lp_data.run_duration
     product_count = len(lp_data.product_data.index)
     machine_count = len(lp_data.machine_available_time.index)
     cols = lp_data.machine_available_time["Machine_Code"].to_list()
-    index = np.repeat(lp_data.product_data["inter_code"].to_numpy(), repeats=period_count)
+    index = np.repeat(lp_data.product_data["with_site"].to_numpy(), repeats=period_count)
     x = np.zeros(shape=(product_count * period_count, machine_count), dtype=np.float32)
     for p in range(product_count):
         prod, machine = np.where(lp_problem.batch.x[p, :, :].T)
@@ -25,49 +60,73 @@ def generate_production_report(lp_data: LPData, lp_problem: LPProblem):
             from_row = p * period_count
             to_row = p * period_count + period_count
             x[from_row: to_row, :][var] = lp_problem.batch.x[p, :, :].T[var].solution_value
-    batch_box = np.repeat(lp_data.product_data["Approved_Batch_Size_MIP"].to_numpy(), repeats=period_count)
-    batch_unit = batch_box * np.repeat(lp_data.product_data["Num_in_Box"].to_numpy(), repeats=period_count)
+    # batch_box = np.repeat(lp_data.product_data["Batch_Box"].to_numpy(), repeats=period_count)
+    # batch_unit = batch_box * np.repeat(lp_data.product_data["Num_in_Box"].to_numpy(), repeats=period_count)
     production_df = pd.DataFrame(data=x, index=index, columns=cols)
-    production_box_df = pd.DataFrame(data=np.multiply(x, batch_box[:, np.newaxis]), index=index, columns=cols)
-    production_unit_df = pd.DataFrame(data=np.multiply(x, batch_unit[:, np.newaxis]), index=index, columns=cols)
-    total_production = np.zeros_like(lp_problem.box_output)
-    a, b = np.where(lp_problem.box_output)
-    for var in zip(a, b):
-        total_production[var] = lp_problem.box_output[var].solution_value
+    production_box_df = pd.merge(production_df, lp_data.product_data.filter(["SKU_Code", "with_site"]),
+                                 how="left", right_on="with_site", left_index=True)
+    production_box_df = production_box_df.drop(labels="with_site", axis=1)
+    production_box_df.insert(loc=0, column="Month", value=np.tile(lp_data.solve_window_dates, product_count))
+    production_box_df = production_box_df.groupby(by=["SKU_Code", "Month"], as_index=False).sum()
+    production_box_df = production_box_df.merge(
+        lp_data.product_data.filter(["SKU_Code", "SKU_name"]).drop_duplicates(subset="SKU_Code"),
+        how="right", on="SKU_Code")
+    production_box_df.insert(loc=1, column="SKU_name", value=production_box_df.pop("SKU_name"))
 
-    all_skus = lp_data.product_data["SKU_Code"].to_numpy()
-    unique_skus, sku_count = np.unique(all_skus, return_counts=True)
-    duplicated_skus = unique_skus[sku_count >= 2]
-    dupl_sku_indices = [np.where(all_skus == sku)[0][0] for sku in duplicated_skus]
+    # production_unit_df = pd.DataFrame(data=np.multiply(x, batch_unit[:, np.newaxis]), index=index, columns=cols)
 
-    def _slack_converter(slack_var, expiry=False):
-        if not expiry:
-            reshaped_slack = np.repeat(slack_var, sku_count, axis=0)
-            reshaped_slack[dupl_sku_indices, :] = 0
-        else:
-            reshaped_slack = slack_var
-        slack_out = np.zeros_like(reshaped_slack)
-        a, b = np.where(reshaped_slack)
-        for var in zip(a, b):
-            slack_out[var] = reshaped_slack[var].solution_value
-        return slack_out.flatten()
-
+    dupl_sku_indices, sku_count = duplicate_sku_calc()
     demands = lp_data.demands.to_numpy()
-    demands[dupl_sku_indices, :] = 0
+    # demands = np.repeat(demands, sku_count, axis=0)
+    # demands[dupl_sku_indices] = 0
     product_names = lp_data.product_data["SKU_name"].to_numpy()
-    dataframes = [production_df, production_box_df, production_unit_df]
+    # dataframes = [production_df, production_box_df, production_unit_df]
+    total_output = get_2d_var_value(lp_problem.box_output)
+    # total_output = np.insert(total_output, lp_data.mask, 0.0, axis=0)
+    opening_stock = np.zeros_like(total_output)
+    sales_loss = np.zeros_like(total_output)
+    opening_stock[:, 0] = lp_data.get_prod_weight("Opening_Stock")
+    sales_loss[:, 0] = np.maximum(demands[:, 0] - opening_stock[:, 0], 0)
+    for period in range(1, period_count):
+        opening_stock[:, period] = np.maximum(opening_stock[:, period-1] - demands[:, period - 1], 0)\
+                                   + total_output[:, period-1]
+        sales_loss[:, period] = np.maximum(demands[:, period] - opening_stock[:, period], 0)
+    closing_stock = np.hstack([opening_stock, (np.maximum(opening_stock[:, -1] - demands[:, -1], 0)\
+                                   + total_output[:, -1])[:, np.newaxis]])[:, :-1]
+    production_box_df.insert(loc=3, column="Box_Output", value=total_output.flatten())
+    # production_box_df.insert(loc=4, column="Sales_loss", value=_slack_converter(lp_problem.salesloss.var).flatten())
+    production_box_df.insert(loc=4, column="Over_stock", value=_slack_converter(lp_problem.overstock.var).flatten())
+    production_box_df.insert(loc=5, column="Total_demand", value=demands.flatten())
+    production_box_df.insert(loc=6, column="Closing_stock", value=closing_stock.flatten())
+    sl_lim = lp_data.dm_offset.to_numpy()
+    # production_box_df["Sales_loss"] = production_box_df["Sales_loss"].to_numpy() * sl_lim.flatten()
+    production_box_df.insert(loc=7, column="sl_lim", value=sl_lim.flatten())
+    production_box_df.insert(loc=7, column="Sales_loss", value=sales_loss.flatten())
+    production_box_df.insert(loc=8, column="Coverage",
+                             value=np.nan_to_num(np.divide(production_box_df["Closing_stock"].to_numpy(),
+                                                           sl_lim.flatten(),
+                                                           where=sl_lim.flatten() != 0).astype(float)))
+    # production_df.insert(loc=0, column="Total_Box_Output", value=total_output.flatten())
+    # production_df.insert(loc=0, column="Month", value=np.tile(lp_data.solve_window_dates, product_count))
+    # production_unit_df.insert(loc=0, column="Month", value=np.tile(lp_data.solve_window_dates, product_count))
+    # production_df.insert(loc=0, column="SKU_name", value=np.repeat(product_names, period_count))
+    # production_df.insert(loc=3, column="Sales_loss", value=_slack_converter(lp_problem.salesloss.var).flatten())
+    # production_df.insert(loc=3, column="Over_stock", value=_slack_converter(lp_problem.overstock.var).flatten())
+    # production_df.insert(loc=0, column="Expiry", value=_slack_converter(lp_problem.expiry.var, expiry=True).flatten())
+    # production_df.insert(loc=3, column="Total_demand", value=demands.flatten())
+    # temp_df = lp_data.product_data.loc[:, ("SKU_Code", "inter_code")]
+    # closing_df = pd.DataFrame(data=get_2d_var_value(lp_problem.closing_salable), index=temp_df["SKU_Code"].unique())
+    # temp_df = temp_df.merge(closing_df, left_on="SKU_Code", right_on=closing_df.index)
+    # production_df.insert(loc=4, column="Closing_stock", value=temp_df.iloc[:, 2:].to_numpy().flatten())
+    # production_box_df.insert(loc=5, column="Closing_stock", value=closing_df.to_numpy().flatten())
+    # sl_lim = lp_data.sales_loss_lim.to_numpy()
+    # sl_lim = np.repeat(sl_lim, sku_count, axis=0)
+    # sl_lim[dupl_sku_indices] = 0.0
+    # production_df.insert(loc=5, column="Coverage",
+    #                      value=np.nan_to_num(np.divide(temp_df.iloc[:, 2:].to_numpy().flatten(),
+    #                                                    sl_lim.flatten(), where=sl_lim.flatten() != 0).astype(float)))
 
-    production_df.insert(loc=0, column="Total_Box_Output", value=total_production.flatten())
-    production_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates, product_count))
-    production_box_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates, product_count))
-    production_unit_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates, product_count))
-    production_df.insert(loc=0, column="SKU_name", value=np.repeat(product_names, period_count))
-    production_df.insert(loc=3, column="Sales_loss", value=_slack_converter(lp_problem.salesloss.var))
-    production_df.insert(loc=3, column="Over_stock", value=_slack_converter(lp_problem.overstock.var))
-    production_df.insert(loc=3, column="Expiry", value=_slack_converter(lp_problem.expiry.var, expiry=True))
-    production_df.insert(loc=3, column="Total_demand", value=demands.flatten())
-
-    return production_df, production_box_df, production_unit_df
+    return production_df, production_box_df
 
 
 def generate_op_based_report(lp_data: LPData, lp_problem: LPProblem):
@@ -75,7 +134,7 @@ def generate_op_based_report(lp_data: LPData, lp_problem: LPProblem):
     product_count = len(lp_data.product_data.index)
     product_names = lp_data.product_data["SKU_name"].to_numpy()
     cols = lp_data.opc_data.iloc[:, -8:].columns.to_list()
-    index = np.repeat(lp_data.product_data["SKU_Code"].to_numpy(), repeats=period_count)
+    index = np.repeat(lp_data.product_data["with_site"].to_numpy(), repeats=period_count)
     cumu_batch_output = np.zeros(shape=(product_count * period_count, len(cols)))
     # total_batch = lp_production.generate_op_batch_variables(0)
     available_wip = lp_data.wip_tensor
@@ -111,16 +170,24 @@ def generate_op_based_report(lp_data: LPData, lp_problem: LPProblem):
     batch_df.insert(loc=0, column="Expiry", value=_slack_converter(lp_problem.expiry.var, expiry=True))
     batch_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates, product_count))
     batch_df.insert(loc=0, column="SKU_name", value=np.repeat(product_names, period_count))
-    return batch_df
+    last_month = lp_data.solve_window_dates[-1]
+    wip_df = batch_df[batch_df["Months"] == last_month].iloc[:, 3:]
+    last_op_indices = np.maximum(lp_data.opc_data.iloc[:, -8:].shape[1] -
+                                 np.flip(lp_data.opc_data.iloc[:, -8:].to_numpy(), axis=1).argmax(axis=1) - 1, 6)
+    for i in range(product_count):
+        wip = wip_df.iloc[i, :] - wip_df.iloc[i, last_op_indices[i]]
+        wip_df.iloc[i, :] = np.maximum(wip.to_numpy(), 0)
+    wip_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates[-1], product_count))
+    return batch_df, wip_df
 
 
 def generate_machine_report(lp_data: LPData, lp_problem: LPProblem):
     period_count = lp_data.run_duration
     product_count = len(lp_data.product_data.index)
     machine_count = len(lp_data.machine_available_time.index)
-    _, production_box_df, production_unit_df = generate_production_report(lp_data, lp_problem)
-    monthly_box_output = production_box_df.groupby(by="Months").sum()
-    monthly_unit_output = production_unit_df.groupby(by="Months").sum()
+    _, production_box_df = generate_production_report(lp_data, lp_problem)
+    monthly_box_output = production_box_df.groupby(by="Month").sum()
+    # monthly_unit_output = production_unit_df.groupby(by="Month").sum()
     mps_time_tensor = lp_problem.mps_times
     mps_time = np.zeros(shape=(product_count * period_count, machine_count), dtype=np.int16)
     for p in range(product_count):
@@ -132,12 +199,12 @@ def generate_machine_report(lp_data: LPData, lp_problem: LPProblem):
     cols = lp_data.machine_available_time["Machine_Code"].to_list()
     index = np.repeat(lp_data.product_data["inter_code"].to_numpy(), repeats=period_count)
     mps_tims_df = pd.DataFrame(data=mps_time, index=index, columns=cols)
-    mps_tims_df.insert(loc=0, column="Months", value=np.tile(lp_data.solve_window_dates, product_count))
-    monthly_mps_time = mps_tims_df.groupby("Months").sum()
+    mps_tims_df.insert(loc=0, column="Month", value=np.tile(lp_data.solve_window_dates, product_count))
+    monthly_mps_time = mps_tims_df.groupby("Month").sum()
     available_times = lp_data.machine_available_time.loc[:, list(map(str, lp_data.solve_window_dates))].T.to_numpy()
     monthly_machine_reversed_time = np.divide(1, available_times, where=(available_times != 0))
     monthly_saturation = monthly_mps_time * monthly_machine_reversed_time
-    return monthly_mps_time, monthly_saturation, monthly_box_output, monthly_unit_output
+    return monthly_mps_time, monthly_saturation, monthly_box_output
 
 
 def generate_raw_material_report(lp_data: LPData, lp_problem: LPProblem):
@@ -184,7 +251,7 @@ def generate_raw_material_report(lp_data: LPData, lp_problem: LPProblem):
                                      columns=cols,
                                      index=material_codes.to_numpy().flatten()).astype(float).round(2)
     for column_index in reversed(range(1, len(rm_consumption_df.columns))):
-        rm_consumption_df.iloc[:, column_index] -= rm_consumption_df.iloc[:, column_index-1]
+        rm_consumption_df.iloc[:, column_index] -= rm_consumption_df.iloc[:, column_index - 1]
     return pure_rm_df, rm_consumption_df
 
 
@@ -228,5 +295,5 @@ def generate_package_material_report(lp_data: LPData, lp_problem: LPProblem):
                                      columns=cols,
                                      index=material_codes.to_numpy().flatten()).astype(float).round(2)
     for column_index in reversed(range(1, len(pm_consumption_df.columns))):
-        pm_consumption_df.iloc[:, column_index] -= pm_consumption_df.iloc[:, column_index-1]
+        pm_consumption_df.iloc[:, column_index] -= pm_consumption_df.iloc[:, column_index - 1]
     return pure_pm_df, pm_consumption_df
