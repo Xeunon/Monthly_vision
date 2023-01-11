@@ -48,14 +48,14 @@ class PolicyDefinition:
                       where=(sales_demands > 0.5)), 1)
         return sl_coefficient
 
-    def _get_relative_weight(self, inter_code):
+    def _get_relative_weight(self, bom_sku):
         """
         Function for getting the relative weight of two same-tier products
         based on resource clash and strategic weight
         :return:
         """
         # Getting coefficient of material consumption
-        product_resources = self.data.contested_resources.loc[inter_code]
+        product_resources = self.data.contested_resources.loc[bom_sku]
         con_res_array = self.data.contested_resources.to_numpy()
         material_coef = np.ones(con_res_array.shape[0])
         if con_res_array.any():
@@ -65,7 +65,7 @@ class PolicyDefinition:
                                      where=con_res_array != 0)
             material_coef = np.max(con_res_coef, axis=1)
         # Getting coefficient of cycle times
-        product_ct = self.data.bottle_neck_ct.loc[inter_code]
+        product_ct = self.data.bottle_neck_ct.loc[bom_sku]
         con_ct_array = self.data.bottle_neck_ct.to_numpy().copy()
         con_ct_coef = np.divide(product_ct.to_numpy()[np.newaxis, :],
                                 con_ct_array,
@@ -73,7 +73,7 @@ class PolicyDefinition:
                                 where=con_ct_array != 0)
         cycletime_coef = np.max(con_ct_coef, axis=1)
         resource_coef = np.max(np.vstack([material_coef, cycletime_coef]), axis=0)
-        product_strategic_weight = self.data.product_data[self.data.product_data["inter_code"] == inter_code]["Strategic_Weight"]
+        product_strategic_weight = self.data.product_data[self.data.product_data["bom_sku"] == bom_sku]["Strategic_Weight"]
         strategic_coef = np.divide(product_strategic_weight.to_numpy(), self.data.product_data["Strategic_Weight"])
         return resource_coef * strategic_coef
 
@@ -111,7 +111,7 @@ class PolicyDefinition:
             same_tier_products = value.copy()
             for index in tqdm(value):
                 target_product = self.data.product_data.iloc[index, :]
-                product_relative_weight = self._get_relative_weight(target_product["inter_code"])
+                product_relative_weight = self._get_relative_weight(target_product["bom_sku"])
                 same_tier_products.remove(index)
                 for cont_index in itertools.product(same_tier_products[:5], range(self.data.run_duration)):
                     self.solver.add_constraint(

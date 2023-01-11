@@ -12,13 +12,13 @@ class SlackVariable:
     def __init__(self,
                  slack_name: str,
                  lp_data: LPData,
-                 solver: Model):
+                 model: Model):
         self.name = slack_name
         self.mask = lp_data.mask
         self.skus = lp_data.product_data["SKU_Code"]
         self.periods, self.period_count = self._calculate_periods(lp_data.prod_active_window)
         self.product_count = self.periods.shape[0]
-        self.solver = solver
+        self.model = model
         self.var = self.create_num_slack_variables()
 
     def create_num_slack_variables(self):
@@ -32,7 +32,7 @@ class SlackVariable:
             prod_idx = np.where(self.periods == True)[0]
             period_idx = np.zeros_like(prod_idx)
         for index in zip(prod_idx, period_idx):
-            slack[index] = self.solver.continuous_var(0, self.solver.infinity, f'{self.name}{list(index)}')
+            slack[index] = self.model.continuous_var(0, self.model.infinity, f'{self.name}{list(index)}')
         return slack
 
     def _calculate_periods(self, active_window):

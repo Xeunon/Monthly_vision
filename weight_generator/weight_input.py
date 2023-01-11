@@ -53,13 +53,13 @@ class WeightingData:
             Also returns the boolean matrix showing which periods each product is active on
             and will have a variable assigned to it (for both run periods and future period)"""
         all_product_data = self.load_csv_data("product_df.csv")
-        all_product_data["inter_code"] = \
+        all_product_data["bom_sku"] = \
             all_product_data["SKU_Code"].astype(str) + "-" + all_product_data["bom_version"].astype(str)
         all_product_count = len(all_product_data.index)
         all_dates_matrix = np.repeat(self.all_period_dates[np.newaxis, :], all_product_count, axis=0)
         dates_matrix = np.repeat(self.solve_window_dates[np.newaxis, :], all_product_count, axis=0)
         bom_data = self.load_csv_data("bom_df.csv")
-        bom_data["inter_code"] = \
+        bom_data["bom_sku"] = \
             bom_data["Product_Code"].astype(str) + "-" + bom_data["BOM_VERSION"].astype(str)
         active_product_mat = self.is_active_calculator(all_product_data, bom_data, all_dates_matrix)
         product_period_counts = np.sum(active_product_mat, axis=1)
@@ -84,12 +84,12 @@ class WeightingData:
     def is_active_calculator(products_df, bom_df, date_matrix):
         """Function for determining if a product is active
             for the period that we are optimizing for."""
-        rayvarz_vec = products_df["inter_code"].to_numpy()
+        rayvarz_vec = products_df["bom_sku"].to_numpy()
         # Vector of rayvarzIDs repeated "period_count" times
         num_cols = date_matrix.shape[1]
         rayvarz_mat = rayvarz_vec[:, np.newaxis].repeat(repeats=num_cols, axis=1)
         # Matrix determining if product is in BOM
-        is_in_bom = np.isin(rayvarz_mat, bom_df["inter_code"])
+        is_in_bom = np.isin(rayvarz_mat, bom_df["bom_sku"])
         missing_bom = tuple(rayvarz_mat[(is_in_bom == False)[:, 0]][:, 0])
         print(f'The following SKU-BOM codes do not exist in the BOM '
               f'dataframe \n and will not be considered in the optimization problem:\n {missing_bom}')
@@ -140,10 +140,10 @@ class WeightingData:
 
     def _generate_operations_data(self, name: str) -> pd.DataFrame:
         operation_data = self.load_csv_data(name)
-        operation_data["inter_code"] = operation_data["Product_Code"].astype(str) + "-" + operation_data[
+        operation_data["bom_sku"] = operation_data["Product_Code"].astype(str) + "-" + operation_data[
             "Bom_Version"].astype(str)
-        inter_sku = self.product_data.filter(items=["inter_code"])
-        operation_data = operation_data.merge(inter_sku, how="right", on="inter_code", copy=True)
+        inter_sku = self.product_data.filter(items=["bom_sku"])
+        operation_data = operation_data.merge(inter_sku, how="right", on="bom_sku", copy=True)
         operation_data.filter(items=["Wet_Granulation",
                                      "Drying",
                                      "Blending",
@@ -152,17 +152,17 @@ class WeightingData:
                                      "Coating",
                                      "Blistering_Counter_Syrup_Filling",
                                      "Manual_Packaging",
-                                     "inter_code"])
-        operation_data.set_index("inter_code", drop=True, inplace=True)
+                                     "bom_sku"])
+        operation_data.set_index("bom_sku", drop=True, inplace=True)
         return operation_data
 
     def _generate_wip_data(self):
         wip_df = self.load_csv_data("wip_df.csv")
         available_wip_df = wip_df[wip_df["Material"] > 0]
-        inter_sku = self.product_data.filter(items=["inter_code", "SKU_Code", "Product_Counter"])
+        inter_sku = self.product_data.filter(items=["bom_sku", "SKU_Code", "Product_Counter"])
         inter_sku["period_active"] = self.prod_active_window[:, 0]
         available_wip_df = available_wip_df.merge(inter_sku, left_on="code", right_on="SKU_Code", how="right")
-        available_wip_df.set_index(keys="inter_code", drop=True, inplace=True)
+        available_wip_df.set_index(keys="bom_sku", drop=True, inplace=True)
         available_wip_df[(available_wip_df["period_active"] == False)] = 0
         available_wip_df = available_wip_df.loc[:, "Material":"Manual_Packaging"].fillna(0)
         available_wip_mat = available_wip_df.iloc[:, 1:].to_numpy()
@@ -177,20 +177,20 @@ class WeightingData:
         timing_data_df = timing_data_df[machine_codes]
         assert (available_time_data["Machine_Code"] == timing_data_df.columns).all(), \
             f'Available time and cycle time machine order does not match'
-        inter_sku = self.product_data.filter(items=["inter_code"])
-        avail_ct_data = inter_sku.merge(timing_data_df, how="left", right_index=True, left_on="inter_code")
-        avail_ct_data.set_index(keys="inter_code", drop=True, inplace=True)
+        inter_sku = self.product_data.filter(items=["bom_sku"])
+        avail_ct_data = inter_sku.merge(timing_data_df, how="left", right_index=True, left_on="bom_sku")
+        avail_ct_data.set_index(keys="bom_sku", drop=True, inplace=True)
         assert not avail_ct_data.iloc[:, 1].isnull().values.any(), \
             f'Cycle time missing for {avail_ct_data[avail_ct_data.iloc[:, 1].isnull()]}'
         allocations = self.load_csv_data("allocation.csv")
         allocations = allocations[(allocations["Machine_Code"].isin(list(avail_ct_data.columns)))]
         allocations = allocations[(allocations["Active"] > 140000) | (allocations["Active"] < -140000)]
-        allocations["inter_code"] = allocations["Product_Code"].astype(str) + "-" + allocations["BOM_Version"].astype(
+        allocations["bom_sku"] = allocations["Product_Code"].astype(str) + "-" + allocations["BOM_Version"].astype(
             str)
         periodwise_avail_ct = np.repeat(avail_ct_data.to_numpy()[:, :, np.newaxis], repeats=self.run_duration, axis=2)
         for _, entry in allocations.iterrows():
-            inter_code = entry["inter_code"]
-            if inter_code not in avail_ct_data.index:
+            bom_sku = entry["bom_sku"]
+            if bom_sku not in avail_ct_data.index:
                 continue
             date, machine = entry["Active"], entry["Machine_Code"]
             if self.solve_window_dates.min() >= date > 0 or date < -self.solve_window_dates.max():
@@ -203,7 +203,7 @@ class WeightingData:
                 deactive_indices = [i for i in range(date_index, self.run_duration)]
             else:
                 deactive_indices = [i for i in range(self.run_duration)]
-            product_index = avail_ct_data.index.to_list().index(inter_code)
+            product_index = avail_ct_data.index.to_list().index(bom_sku)
             machine_index = avail_ct_data.columns.to_list().index(machine)
             periodwise_avail_ct[product_index, machine_index, deactive_indices] = 0
         # available_time_data.set_index(keys="Machine_Code", drop=True, inplace=True)
@@ -214,11 +214,11 @@ class WeightingData:
         opening_df = self.load_csv_data("opening_df.csv")
         order_df = self.load_csv_data("order_df.csv")
         bom_data = self.load_csv_data("bom_df.csv")
-        bom_data.insert(loc=1, column="inter_code",
+        bom_data.insert(loc=1, column="bom_sku",
                         value=bom_data["Product_Code"].astype(str) + "-" + bom_data["BOM_VERSION"].astype(str))
-        bom_data = bom_data[bom_data["inter_code"].isin(self.product_data["inter_code"])]
-        missing_codes = self.product_data[self.product_data["inter_code"]
-                                              .isin(bom_data["inter_code"]) == False]["inter_code"].to_list()
+        bom_data = bom_data[bom_data["bom_sku"].isin(self.product_data["bom_sku"])]
+        missing_codes = self.product_data[self.product_data["bom_sku"]
+                                              .isin(bom_data["bom_sku"]) == False]["bom_sku"].to_list()
         assert not missing_codes, f'BOM data does not include {missing_codes}'
         avail_bom_data = bom_data[(bom_data["MIP_Activation"] == 1) &
                                   (bom_data["BOM_Status"] == 1) &
@@ -243,13 +243,13 @@ class WeightingData:
                                                            self.product_data["Approved_Batch_Size_MIP"].to_numpy()[:,
                                                            np.newaxis])),
                                          self.prod_active_window)
-        rsrc_cons_factor = self.bom_data.drop_duplicates(subset=["inter_code", "Material_Code"])
-        rsrc_cons_factor = rsrc_cons_factor.pivot(index="inter_code",
+        rsrc_cons_factor = self.bom_data.drop_duplicates(subset=["bom_sku", "Material_Code"])
+        rsrc_cons_factor = rsrc_cons_factor.pivot(index="bom_sku",
                                                   columns="Material_Code",
                                                   values="Consumption_Factor_(Wastage)")
-        rsrc_cons_factor = self.product_data["inter_code"].to_frame().merge(rsrc_cons_factor,
-                                                                            how="left", on="inter_code")
-        rsrc_cons_factor = rsrc_cons_factor.set_index(keys="inter_code", inplace=False, drop=True).fillna(np.PZERO)
+        rsrc_cons_factor = self.product_data["bom_sku"].to_frame().merge(rsrc_cons_factor,
+                                                                            how="left", on="bom_sku")
+        rsrc_cons_factor = rsrc_cons_factor.set_index(keys="bom_sku", inplace=False, drop=True).fillna(np.PZERO)
         rsrc_demand = rsrc_cons_factor.to_numpy().T @ sales_demand_batch
         cumulative_rsrc_demand = np.cumsum(rsrc_demand, axis=1)
         scarce_rsrc_mask = (cumulative_rsrc_demand > cumulative_available_rsrc).sum(axis=1) > 1
